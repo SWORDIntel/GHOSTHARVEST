@@ -1,0 +1,3 @@
+Plain text file with   multiple spaces and
+
+multiple newlines.
