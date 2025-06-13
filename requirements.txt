@@ -1,0 +1,6 @@
+python-docx
+PyMuPDF
+aiofiles
+aiohttp
+lxml
+npyscreen
