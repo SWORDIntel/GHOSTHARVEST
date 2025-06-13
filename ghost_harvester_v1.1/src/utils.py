@@ -1,132 +1,130 @@
 import asyncio
-import logging
-import random
 import aiohttp
+import subprocess
+import random
+import logging
 import aiofiles
+import os
 
-# Logging configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --- Asynchronous Logging Setup ---
+async def setup_logging(log_file_path: str = os.path.join('data', 'logs', 'harvester.log')):
+    """Sets up asynchronous logging to console and a file."""
+    log_dir = os.path.dirname(log_file_path)
+    os.makedirs(log_dir, exist_ok=True)
 
-async def run_command(command: list, description: str):
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO) # Default logging level
+
+    # Console Handler
+    console_handler = logging.StreamHandler()
+    console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    root_logger.addHandler(console_handler)
+
+    # File Handler
+    file_handler = logging.FileHandler(log_file_path)
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    root_logger.addHandler(file_handler)
+
+    logging.info("Logging setup complete.")
+
+async def run_command(command: list, description: str, timeout: int = 60) -> tuple[bool, str]:
     """
-    Runs a shell command asynchronously.
-    Logs the command, description, stdout, and stderr.
-    Raises an exception if the command returns a non-zero exit code.
+    Asynchronously runs a shell command and logs its output.
+    Returns (success: bool, output: str).
     """
-    logger.info(f"Running command ({description}): {' '.join(command)}")
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
+    logging.info(f"Executing command: {' '.join(command)} ({description})")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
 
-    stdout_str = stdout.decode().strip()
-    stderr_str = stderr.decode().strip()
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
 
-    if stdout_str:
-        logger.info(f"Stdout ({description}): {stdout_str}")
-    if stderr_str:
-        logger.error(f"Stderr ({description}): {stderr_str}")
+        stdout_str = stdout.decode('utf-8', errors='ignore').strip()
+        stderr_str = stderr.decode('utf-8', errors='ignore').strip()
 
-    if process.returncode != 0:
-        raise Exception(f"Command '{' '.join(command)}' failed with exit code {process.returncode}")
-    return stdout_str
+        if process.returncode != 0:
+            full_output = f"STDOUT: {stdout_str}\nSTDERR: {stderr_str}" if stdout_str or stderr_str else "No output."
+            logging.error(f"Command '{' '.join(command)}' failed (Exit Code: {process.returncode}): {full_output}")
+            return False, stderr_str if stderr_str else stdout_str
+        else:
+            if stdout_str or stderr_str: # Log output only if there's something to show
+                logging.debug(f"Command '{' '.join(command)}' succeeded. STDOUT: {stdout_str} STDERR: {stderr_str}")
+            return True, stdout_str if stdout_str else stderr_str # Return stdout on success, or stderr if stdout is empty
+    except FileNotFoundError:
+        logging.error(f"Command '{command[0]}' not found. Ensure it's installed and in PATH.")
+        return False, f"Command '{command[0]}' not found."
+    except asyncio.TimeoutError:
+        logging.error(f"Command '{' '.join(command)}' timed out after {timeout} seconds.")
+        # Try to kill the process if it still exists
+        if process.returncode is None: # Process hasn't terminated
+            try:
+                process.kill()
+                await process.wait() # Ensure kill is processed
+            except ProcessLookupError:
+                logging.debug(f"Process {process.pid} already terminated.")
+            except Exception as e_kill:
+                logging.error(f"Error trying to kill timed-out process {process.pid}: {e_kill}")
+        return False, "Command timed out."
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while running command '{' '.join(command)}': {e}")
+        return False, str(e)
 
-async def get_current_public_ip():
-    """
-    Fetches the current public IP address.
-    Uses aiohttp to make a request to api.ipify.org.
-    Handles potential errors during the request.
-    """
+async def get_current_public_ip(ip_check_service: str) -> str | None:
+    """Asynchronously checks the current public IP address."""
+    logging.debug(f"Checking public IP via {ip_check_service}")
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.ipify.org") as response:
-                response.raise_for_status()  # Raise an exception for bad status codes
-                ip = await response.text()
-                logger.info(f"Current public IP: {ip}")
-                return ip.strip()
+            async with session.get(ip_check_service, timeout=10) as response:
+                response.raise_for_status()
+                ip = (await response.text()).strip()
+                logging.debug(f"Public IP detected: {ip}")
+                return ip
     except aiohttp.ClientError as e:
-        logger.error(f"Error fetching public IP: {e}")
+        logging.warning(f"Failed to get public IP from {ip_check_service}: {e}")
+        return None
+    except asyncio.TimeoutError:
+        logging.warning(f"IP check service {ip_check_service} timed out.")
+        return None
+    except Exception as e:
+        logging.warning(f"An unexpected error occurred during IP check: {e}")
         return None
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:53.0) Gecko/20100101 Firefox/53.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_5) AppleWebKit/603.2.4 (KHTML, like Gecko) Version/10.1.1 Safari/603.2.4",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/99.0.1150.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
-]
+def get_random_user_agent() -> str:
+    """Returns a random User-Agent string."""
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 13_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Android 10; Mobile; rv:100.0) Gecko/100.0 Firefox/100.0",
+        "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Mobile Safari/537.36",
+        "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
+    ]
+    return random.choice(user_agents)
 
-def get_random_user_agent():
-    """
-    Returns a random User-Agent string from a predefined list.
-    """
-    return random.choice(USER_AGENTS)
+async def read_file_async(file_path: str) -> str:
+    """Asynchronously reads content from a file."""
+    async with aiofiles.open(file_path, mode='r', encoding='utf-8') as f:
+        content = await f.read()
+    return content
 
-async def read_file(file_path: str):
-    """
-    Reads file content asynchronously.
-    """
-    try:
-        async with aiofiles.open(file_path, mode='r', encoding='utf-8') as f:
-            content = await f.read()
-            logger.info(f"Successfully read file: {file_path}")
-            return content
-    except Exception as e:
-        logger.error(f"Error reading file {file_path}: {e}")
-        raise
+async def append_to_file_async(file_path: str, content: str):
+    """Asynchronously appends content to a file, creating it if it doesn't exist."""
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    async with aiofiles.open(file_path, mode='a', encoding='utf-8') as f:
+        await f.write(content)
+        await f.write('\n') # Ensure newline for log-like files
 
-async def append_to_file(file_path: str, content: str):
-    """
-    Appends content to a file asynchronously.
-    """
-    try:
-        async with aiofiles.open(file_path, mode='a', encoding='utf-8') as f:
-            await f.write(content)
-            logger.info(f"Successfully appended to file: {file_path}")
-    except Exception as e:
-        logger.error(f"Error appending to file {file_path}: {e}")
-        raise
-
-if __name__ == '__main__':
-    # Example Usage (optional - for testing purposes)
-    async def main_test():
-        # Test run_command
-        try:
-            await run_command(['echo', 'Hello World'], 'Test Echo')
-            # Example of a failing command
-            # await run_command(['ls', '/nonexistent'], 'Test Failing LS')
-        except Exception as e:
-            logger.error(f"Command execution error: {e}")
-
-        # Test get_current_public_ip
-        ip = await get_current_public_ip()
-        if ip:
-            logger.info(f"Fetched IP: {ip}")
-        else:
-            logger.warning("Could not fetch IP.")
-
-        # Test get_random_user_agent
-        ua = get_random_user_agent()
-        logger.info(f"Random User Agent: {ua}")
-
-        # Test file operations
-        test_file = "test_async_file.txt"
-        try:
-            await append_to_file(test_file, "Line 1\n")
-            await append_to_file(test_file, "Line 2\n")
-            content = await read_file(test_file)
-            logger.info(f"Test file content:\n{content}")
-        except Exception as e:
-            logger.error(f"File operation error: {e}")
-        finally:
-            # Clean up the test file
-            import os
-            if os.path.exists(test_file):
-                os.remove(test_file)
-                logger.info(f"Cleaned up {test_file}")
-
-    asyncio.run(main_test())
+async def write_file_async(file_path: str, content: str):
+    """Asynchronously writes content to a file, overwriting if it exists."""
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    async with aiofiles.open(file_path, mode='w', encoding='utf-8') as f:
+        await f.write(content)
